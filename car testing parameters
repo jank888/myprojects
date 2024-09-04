@@ -1,0 +1,446 @@
+import numpy as np
+import matplotlib.pyplot as plt
+import math
+from scipy.spatial import distance_matrix
+import pygame
+from pygame.locals import *
+import sys
+from PIL import Image
+import heapq
+
+#________________GLOBAL_VAR_____________
+population_n = 100
+selection_n = 60 # min 50
+copied_parents = math.ceil((population_n-selection_n)/2)
+mutation_n = 2 #how many mutations each new individual has
+total_laps = 0
+generation_n = 1
+count = 0
+
+population = []
+
+#________________PYGAME_VARS____________
+HEIGHT = 648
+WIDTH = 1152
+FPS = 120
+
+grey = pygame.Color(100,100,100)
+black = pygame.Color(0,0,0)
+white = pygame.Color(255,255,255)
+green = pygame.Color(0,100,0)
+
+race_track = pygame.image.load("map3.jpg")
+
+# -----------------ROAD------------------
+road_im = np.array(Image.open("map3.jpg"))
+
+road = np.empty((WIDTH, HEIGHT))
+for i in range(WIDTH):
+    for j in range(HEIGHT):
+        # road_im is indexed [j,i], while road is indexed [i,j], they are transposed
+        if int(road_im[j,i,0]) + int(road_im[j,i,1]) + int(road_im[j,i,2]) > 300:
+          road[i][j] = 1
+        else:
+            road[i][j] = -1
+    
+
+# -----------------------CAR-------------------
+
+# parameters
+            
+#max speed
+max_speed = 15
+max_truning_speed = 30
+
+acc_multiplier = 5
+
+velpen = 0.9 #if outside the road, it reduces the speed by a % every time
+dt = 0.1
+car_size = 13
+sightdist = car_size * 1.9 #how far away it can see. // I'm not sure, but I think that the furthest it can see is sightdist * sightnum
+sightnum = 5
+#number of eyes. minumum 3
+numeyes = 5
+nn_size = [numeyes*sightnum,2]
+layers_n = len(nn_size)
+
+# initial conditions
+# posi =  np.array([125,465] )
+posi =  np.array([945,415] )
+veli =  np.array([0,0] )
+anglei = np.deg2rad(-60)
+
+check_point_radius = 70
+checkpoints = np.array([np.array([945,415]),np.array([845,460]),np.array([710,450]),np.array([560,390]),np.array([405,425]),np.array([225,420]),np.array([195,225]),np.array([320,140]),np.array([505,105]),np.array([670,120]),np.array([850,190]),np.array([990,310])])
+checkpoints_num = len(checkpoints)
+checkpoint_dists = np.zeros(checkpoints_num)
+checkpoint_rewards = np.zeros(checkpoints_num)
+
+
+# the same but simpler. it also makes checkpoint_rewards[i] = to something (which is good so cars get rewarded when they go from the last checkpoint to the first one when they restart the lap)
+for i in range(checkpoints_num):
+    checkpoint_dists[i] = np.linalg.norm(checkpoints[i] - checkpoints[(i+1) % checkpoints_num]) 
+    checkpoint_rewards[i] = checkpoint_rewards[i-1] + checkpoint_dists[i-1] 
+
+
+class Car(pygame.sprite.Sprite):
+
+    def __init__(self):
+        #for each car
+        super().__init__() 
+        self.surf = pygame.Surface((car_size, car_size), pygame.SRCALPHA)
+        self.orig_surf = self.surf
+        self.surf.fill((255,165,0))
+        self.rect = self.surf.get_rect(center = (posi[0], posi[1]))
+
+        self.pos = posi
+        self.vel = veli
+        self.angle = anglei
+        self.w = 0 # w is the derivative of angle with respect to time
+        
+        #for each car's wheels
+        #each wheel has a scalar number which indicates its speed and acc. the first number is for left wheel and second for right wheel
+        self.wheelvel = np.array([10,10])
+        self.wheelacc = np.array([0,0])
+        #for fitness
+        self.fitness = 0
+        self.checkpoint = 1
+        self.laps = 0
+
+        #cars NN
+        self.NN = NN(nn_size)
+
+    def actualize(self):  
+
+        #NN controls wheelvel
+        vision_input = self.see()*acc_multiplier
+        self.wheelacc = self.NN.predict(vision_input) 
+
+        #euler method of integration.
+
+        #wheelacc should be calculated by the neural network
+        self.wheelvel = self.wheelvel + self.wheelacc * dt
+
+        if self.wheelvel[0] < -1*max_speed:
+            self.wheelvel[0] = -1*max_speed
+        elif self.wheelvel[0] > max_speed:
+            self.wheelvel[0] = max_speed
+
+        if self.wheelvel[1] < -1*max_speed:
+            self.wheelvel[1] = -1*max_speed
+        elif self.wheelvel[1] > max_speed:
+            self.wheelvel[1] = max_speed
+
+        speed = (self.wheelvel[0] + self.wheelvel[1]) / 2 
+
+        #Here if that wheel is outside the road, we make the vel smaller as punishment
+        if (self.onRoad() != 1 and speed > max_speed*0.1):
+            self.wheelvel *= velpen
+            speed *= velpen
+
+        #euler for angle
+        self.w = -(self.wheelvel[0] - self.wheelvel[1]) / car_size
+
+        if self.w > max_truning_speed:
+            self.w = max_truning_speed
+        if self.w < -max_truning_speed:
+            self.w = -max_truning_speed
+        
+        self.angle = self.angle + self.w * dt
+
+        #angle should stay between 0-2pi
+        if self.angle >= np.pi*2:
+            self.angle -= np.pi*2
+        elif self.angle < 0:
+            self.angle += np.pi*2
+
+        #vel of the car is the average of both wheels velocity (and multiplied by the unit vector with the angle of the car)
+        
+        if speed > max_speed:
+            speed = max_speed
+
+        self.vel =  speed * np.array( [math.sin(self.angle), math.cos(self.angle)] )
+        
+        # euler for position
+        self.pos = self.pos + self.vel * dt
+
+        # drawing new position
+        self.surf = pygame.transform.rotate(self.orig_surf, np.rad2deg(self.angle))
+        self.rect = self.surf.get_rect(center = self.pos)
+        self.rect.center = self.pos
+
+    def calcFitness(self):
+        global total_laps
+
+        distance_from_next = np.linalg.norm(self.pos - checkpoints[self.checkpoint])
+        if distance_from_next <= check_point_radius:
+            self.checkpoint += 1
+        
+        if self.checkpoint >= checkpoints_num:
+            self.checkpoint = 0
+            self.laps += 1
+            # print("how many counts it took to do one lap: ", count)
+            total_laps = total_laps + 1
+        
+        self.fitness = self.laps * checkpoint_rewards[checkpoints_num-1] + checkpoint_rewards[self.checkpoint] - (distance_from_next)
+
+        if self.fitness < 0:
+            self.fitness = 0
+
+    #as input it gets which eye is looking, and returns an array with the values of the road in that direction
+    #when you call the function you should call it in a loop for i in range(numeyes)
+    def see(self): 
+
+        view = np.empty(sightnum*numeyes)
+
+        for i in range(numeyes):
+            direction = self.angle - math.pi / 2 + i * math.pi / (numeyes-1)
+
+            if direction >= np.pi*2:
+                direction -= np.pi*2
+            if direction < 0:
+                direction += np.pi*2
+    
+            for j in range(sightnum):
+                index_0 = round( self.pos[0] + math.sin(direction) * sightdist * (j+1))
+                index_1 = round( self.pos[1] +  math.cos(direction) * sightdist * (j+1))
+                # Preventing out of index error
+                if index_0 >= 0 and index_0 < WIDTH and index_1 >= 0 and index_1 < HEIGHT:
+                    view[i*sightnum+j] = road[ index_0 , index_1 ]
+                else:
+                    view[i*sightnum+j] = -1 #if it's waaay out the screen
+
+        return view
+
+
+# this should return the same value as the value of the road at that point (a -1 (or false) if outside the road and viceversa)
+    def onRoad(self):
+        index_0 = round(self.pos[0])
+        index_1 = round(self.pos[1])   
+        # Preventing out of index error
+        if index_0 >= 0 and index_0 < WIDTH and index_1 >= 0 and index_1 < HEIGHT:
+            return road[ index_0 , index_1 ]
+        else: 
+            return -1 #if it's waaay out the screen
+    
+
+
+#Neural Network Class
+class NN:
+
+    def __init__(self,sizes):
+        self.sizes = sizes
+        self.layers = []
+        for i in range(len(self.sizes)-1):
+                self.layers.append(FCL(sizes[i],sizes[i+1]))
+        
+    #predicts 
+    def predict(self,inp):
+        for layer in self.layers:
+            layer.inp = inp
+            layer.out = np.tanh(layer.weights.dot(layer.inp)+layer.biases)
+            inp = layer.out
+
+        return layer.out   
+
+#Class of a NN layer
+class FCL:
+
+    #initialized with random biases and weights
+    def __init__(self,in_size,out_size):
+        self.inp = np.zeros(in_size)
+        self.out = np.zeros(out_size)
+        self.weights = np.random.rand(out_size,in_size)*2-1
+        self.biases = np.random.rand(out_size)*2-1
+
+#GENETIC_ALGORITHM_FUNCTIONS_________________________________________________________________________
+
+avg_fitness = []
+#list of cars as the parameter
+def selection(population):
+
+    fitness_arr = []
+    parents = []
+    best_parents = []
+
+    for i in range(population_n):
+        fitness_arr.append(population[i].fitness)
+
+    avg_fitness.append( sum(fitness_arr) / population_n / count)
+
+    for i in range(population_n):
+        fitness_arr[i] = (fitness_arr[i]/10)**3
+
+    random_choices = np.random.choice(population_n,selection_n,True,fitness_arr/sum(fitness_arr))
+
+    for i in range(selection_n*2):
+        parents.append(population[random_choices[i % selection_n]])
+
+    best_parents_index = [fitness_arr.index(i) for i in heapq.nlargest(copied_parents, fitness_arr)]
+    for i in best_parents_index:
+        best_parents.append(population[i])
+
+    return parents, best_parents
+
+
+def give_birth(selected): #I had to name it this
+    parents, best_parents = selected #just unpacking
+    new_gen = []
+    #baby creation
+    for i in range(population_n):
+        baby = Car()
+
+        if i < selection_n:
+            for j in range(layers_n-1):
+                weight_genes = np.random.randint(2,size = (nn_size[j+1],nn_size[j]))
+                bias_genes = np.random.randint(2,size = nn_size[j+1])
+                baby.NN.layers[j].weights = (np.multiply(parents[i*2].NN.layers[j].weights, weight_genes) + np.multiply(parents[i*2+1].NN.layers[j].weights, np.ones((nn_size[j+1], nn_size[j])) - weight_genes))
+                baby.NN.layers[j].biases = (np.multiply(parents[i*2].NN.layers[j].biases,bias_genes) + np.multiply(parents[i*2+1].NN.layers[j].biases, np.ones(nn_size[j+1]) - bias_genes))
+
+                
+                for _ in range(mutation_n):
+                    if np.random.rand() < (1 / nn_size[j]):
+                        baby.NN.layers[j].biases[np.random.choice(nn_size[j+1])] = np.random.rand() * 2 - 1
+                    else:
+                        baby.NN.layers[j].weights[np.random.choice(nn_size[j+1])][np.random.choice(nn_size[j])] = np.random.rand() * 2 - 1
+        else:
+            # The best parents are kept to the next gen.
+            
+            baby.NN.layers = best_parents[(i - selection_n) % copied_parents].NN.layers
+
+            for _ in range(mutation_n):
+                if np.random.rand() < (nn_size[j+1] / nn_size[j]):
+                    # baby.NN.layers[j].biases[np.random.choice(nn_size[j+1])] = np.random.rand() * 2 - 1
+                    baby.NN.layers[j].biases[np.random.choice(nn_size[j+1])] *= (np.random.rand()/2+0.75)
+                else:
+                    # baby.NN.layers[j].weights[np.random.choice(nn_size[j+1])][np.random.choice(nn_size[j])] = np.random.rand() * 2 - 1
+                    baby.NN.layers[j].weights[np.random.choice(nn_size[j+1])][np.random.choice(nn_size[j])] *= (np.random.rand()/2+0.75)
+
+        new_gen.append(baby) 
+    return new_gen
+
+
+max_gen_dist_list = []
+def max_genetic_distance (population): 
+    genes = []
+    for i in range(population_n):
+        ind_genome = np.concatenate((population[i].NN.layers[0].biases , population[i].NN.layers[0].weights[0], population[i].NN.layers[0].weights[1]) , axis = 0)
+        genes.append(ind_genome)
+
+    max_gen_dist = np.max( distance_matrix( genes, genes ) )
+    max_gen_dist_list.append(max_gen_dist)
+
+
+#pygame initialization
+pygame.init()
+FramePerSec = pygame.time.Clock()
+ 
+displaysurface = pygame.display.set_mode((WIDTH, HEIGHT))
+pygame.display.set_caption("Game")
+
+all_sprites = pygame.sprite.Group()
+
+#creating population #1 for testing
+for i in range(population_n):
+    population.append(Car())
+    all_sprites.add(population[i])
+
+
+#---------------main loop-------------------------
+while True:
+    
+    #exit
+    for event in pygame.event.get():
+        if event.type == QUIT:
+            
+            generations = np.linspace(1, len(avg_fitness),  len(avg_fitness))
+
+            fig, ax1 = plt.subplots()
+            ax2 = ax1.twinx()
+            color = 'tab:blue'
+            ax1.plot(generations, avg_fitness, '-', color = color)
+            ax1.set_xlabel('Generations')
+            ax1.set_ylabel('Fitness', color = color)
+
+            color = 'tab:orange'
+            ax2.plot(generations, max_gen_dist_list, '-', color = color)
+            ax2.set_ylabel('Max Genetic Distance', color = color)
+            plt.show()
+
+            pygame.quit()
+            sys.exit()
+        if event.type == pygame.KEYDOWN:
+            if event.key == pygame.K_SPACE:
+
+                race_track = pygame.image.load("map5.jpg")
+
+
+                road_im = np.array(Image.open("map5.jpg"))
+
+                road = np.empty((WIDTH, HEIGHT))
+                for i in range(WIDTH):
+                    for j in range(HEIGHT):
+                        # road_im is indexed [j,i], while road is indexed [i,j], they are transposed
+                        if int(road_im[j,i,0]) + int(road_im[j,i,1]) + int(road_im[j,i,2]) > 300:
+                            road[i][j] = 1
+                        else:
+                            road[i][j] = -1
+
+                population = give_birth(selection(population))
+            
+                for entity in all_sprites:
+                    entity.kill()
+                for i in range(population_n):
+                    population[i].angle = 0
+                    all_sprites.add(population[i])
+                FramePerSec.tick(1)
+
+
+    displaysurface.fill(green)
+    displaysurface.blit(race_track,(0,0))
+    
+    for i in range(population_n):
+        population[i].actualize()
+        population[i].calcFitness()
+    for entity in all_sprites:
+        displaysurface.blit(entity.surf, entity.rect)
+
+    pygame.display.update()
+    FramePerSec.tick(FPS)
+
+    count += 1
+    if (count == (300 + generation_n * 150) or count == 3000):
+
+        print(generation_n)
+        print(total_laps)
+        total_laps = 0
+        
+        max_genetic_distance(population)
+        population = give_birth(selection(population))
+        
+        for entity in all_sprites:
+            entity.kill()
+        for i in range(population_n):
+            all_sprites.add(population[i])
+        FramePerSec.tick(1)
+
+        generation_n += 1
+        count = 0
+
+        if generation_n == 50:
+            generations = np.linspace(1, len(avg_fitness),  len(avg_fitness))
+
+            fig, ax1 = plt.subplots()
+            ax2 = ax1.twinx()
+            color = 'tab:blue'
+            ax1.plot(generations, avg_fitness, '-', color = color)
+            ax1.set_xlabel('Generations')
+            ax1.set_ylabel('Fitness', color = color)
+
+            color = 'tab:orange'
+            ax2.plot(generations, max_gen_dist_list, '-', color = color)
+            ax2.set_ylabel('Max Genetic Distance', color = color)
+            plt.show()
+
+            pygame.quit()
+            sys.exit()
